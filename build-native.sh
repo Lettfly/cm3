@@ -17,13 +17,6 @@ IMG_FILE="${WORK_DIR}/${IMG_NAME}.img"
 BOOT_MB=256
 ROOT_MB=3072   # 3 GB rootfs
 
-# Debian Trixie as target (full network access on WSL2)
-DEBIAN_MIRROR="http://deb.debian.org/debian"
-DEBIAN_SUITE="trixie"
-
-# Raspberry Pi package repo
-RPI_MIRROR="http://archive.raspberrypi.com/debian"
-
 FIRST_USER=lett
 FIRST_PASS=hell
 TARGET_HOSTNAME=devterm
@@ -33,6 +26,29 @@ FIRMWARE_TAG="1.20240529"
 FIRMWARE_BASE="https://github.com/raspberrypi/firmware/raw/${FIRMWARE_TAG}/boot"
 
 log() { echo "[$(date +%T)] $*"; }
+
+# ── Auto-detect accessible mirrors ──────────────────────────────────────────
+detect_mirrors() {
+    log "Detecting accessible mirrors..."
+    if curl -s --max-time 5 http://deb.debian.org/debian/dists/trixie/Release -o /dev/null -w '' 2>/dev/null \
+       && [ "$(curl -s --max-time 5 http://deb.debian.org/debian/dists/trixie/Release -o /dev/null -w '%{http_code}' 2>/dev/null)" = "200" ]; then
+        BOOTSTRAP_MIRROR="http://deb.debian.org/debian"
+        BOOTSTRAP_SUITE="trixie"
+        BOOTSTRAP_COMPONENTS="main,contrib,non-free,non-free-firmware"
+        USE_RPI_REPO=1
+        log "  Using Debian Trixie (full network access)"
+    elif curl -s --max-time 5 http://ports.ubuntu.com/ubuntu-ports/dists/noble/Release -o /dev/null -w '' 2>/dev/null \
+       && [ "$(curl -s --max-time 5 http://ports.ubuntu.com/ubuntu-ports/dists/noble/Release -o /dev/null -w '%{http_code}' 2>/dev/null)" = "200" ]; then
+        BOOTSTRAP_MIRROR="http://ports.ubuntu.com/ubuntu-ports"
+        BOOTSTRAP_SUITE="noble"
+        BOOTSTRAP_COMPONENTS="main,restricted,universe,multiverse"
+        USE_RPI_REPO=0
+        log "  Using Ubuntu Noble armhf (restricted network fallback)"
+    else
+        log "ERROR: No accessible armhf mirror found (tried deb.debian.org, ports.ubuntu.com)"
+        exit 1
+    fi
+}
 
 # ── Install host build dependencies (Ubuntu 22.04) ───────────────────────────
 install_deps() {
@@ -110,23 +126,35 @@ create_image() {
         USE_KPARTX=1
     fi
 
-    local p1="${PART1:-${LOOP}p1}"
-    local p2="${PART2:-${LOOP}p2}"
+    PART1="${PART1:-${LOOP}p1}"
+    PART2="${PART2:-${LOOP}p2}"
 
-    mkfs.vfat -F 32 -n boot   "${p1}"
-    mkfs.ext4 -L rootfs -q    "${p2}"
+    mkfs.vfat -F 32 -n boot   "${PART1}"
+    mkfs.ext4 -L rootfs -q    "${PART2}"
 
     mkdir -p "${ROOTFS}"
-    mount "${p2}" "${ROOTFS}"
+    mount "${PART2}" "${ROOTFS}"
     mkdir -p "${ROOTFS}/boot/firmware"
-    mount "${p1}" "${ROOTFS}/boot/firmware"
-    log "Partitions formatted and mounted"
+
+    # Try mounting FAT boot partition; if vfat module unavailable, use mtools
+    if mount "${PART1}" "${ROOTFS}/boot/firmware" 2>/dev/null; then
+        BOOT_MOUNTED=1
+        log "Partitions formatted and mounted (vfat direct)"
+    else
+        BOOT_MOUNTED=0
+        # Prepare mtools config for writing to boot partition via mcopy
+        BOOT_OFFSET=$(parted -s "${IMG_FILE}" unit B print | awk '/^ 1/{gsub("B",""); print $2}')
+        MTOOLSRC_FILE="${WORK_DIR}/mtoolsrc"
+        echo "drive b: file=\"${IMG_FILE}\" offset=${BOOT_OFFSET}" > "${MTOOLSRC_FILE}"
+        export MTOOLS_SKIP_CHECK=1
+        log "Partitions formatted; boot partition via mtools (no vfat kernel module)"
+    fi
 }
 
 # ── Download RPi firmware files from GitHub ────────────────────────────────────
 download_firmware() {
     log "Downloading RPi firmware (tag: ${FIRMWARE_TAG}) from GitHub..."
-    local dst="${ROOTFS}/boot/firmware"
+    local fw_tmp="${WORK_DIR}/firmware-dl"
     local files=(
         bootcode.bin
         start.elf
@@ -149,31 +177,50 @@ download_firmware() {
         gpio-fan.dtbo
         i2s-dac.dtbo
     )
-    mkdir -p "${dst}/overlays"
+    mkdir -p "${fw_tmp}/overlays"
     for f in "${files[@]}"; do
         printf "  %-40s" "${f}"
-        curl -fsSL --retry 3 "${FIRMWARE_BASE}/${f}" -o "${dst}/${f}" 2>/dev/null \
+        curl -fsSL --retry 3 "${FIRMWARE_BASE}/${f}" -o "${fw_tmp}/${f}" 2>/dev/null \
             && echo "OK" || echo "SKIP"
     done
     for f in "${overlays[@]}"; do
         printf "  overlays/%-32s" "${f}"
-        curl -fsSL --retry 3 "${FIRMWARE_BASE}/overlays/${f}" -o "${dst}/overlays/${f}" 2>/dev/null \
+        curl -fsSL --retry 3 "${FIRMWARE_BASE}/overlays/${f}" -o "${fw_tmp}/overlays/${f}" 2>/dev/null \
             && echo "OK" || echo "SKIP"
     done
-    log "Firmware download complete"
+
+    # Copy firmware to boot partition
+    if [ "${BOOT_MOUNTED}" = "1" ]; then
+        local dst="${ROOTFS}/boot/firmware"
+        mkdir -p "${dst}/overlays"
+        cp "${fw_tmp}"/*.{bin,elf,dat,dtb,img} "${dst}/" 2>/dev/null || true
+        cp "${fw_tmp}"/*.{broadcom,linux} "${dst}/" 2>/dev/null || true
+        cp "${fw_tmp}"/overlays/*.dtbo "${dst}/overlays/" 2>/dev/null || true
+    else
+        MTOOLSRC="${MTOOLSRC_FILE}" mmd b:/overlays 2>/dev/null || true
+        for f in "${fw_tmp}"/*.{bin,elf,dat,dtb,img,broadcom,linux}; do
+            [ -f "$f" ] || continue
+            MTOOLSRC="${MTOOLSRC_FILE}" mcopy -o "$f" "b:/$(basename "$f")" 2>/dev/null || true
+        done
+        for f in "${fw_tmp}"/overlays/*.dtbo; do
+            [ -f "$f" ] || continue
+            MTOOLSRC="${MTOOLSRC_FILE}" mcopy -o "$f" "b:/overlays/$(basename "$f")" 2>/dev/null || true
+        done
+    fi
+    log "Firmware download and deploy complete"
 }
 
 # ── Bootstrap Debian Trixie armhf rootfs ──────────────────────────────────────
 bootstrap_rootfs() {
-    log "Bootstrapping Debian Trixie armhf rootfs (this takes a few minutes)..."
+    log "Bootstrapping ${BOOTSTRAP_SUITE} armhf rootfs (this takes a few minutes)..."
     debootstrap \
         --arch=armhf \
-        --components=main,contrib,non-free,non-free-firmware \
+        --components="${BOOTSTRAP_COMPONENTS}" \
         --include=ca-certificates \
         --foreign \
-        "${DEBIAN_SUITE}" \
+        "${BOOTSTRAP_SUITE}" \
         "${ROOTFS}" \
-        "${DEBIAN_MIRROR}"
+        "${BOOTSTRAP_MIRROR}"
 
     # Copy qemu-arm-static so we can chroot into armhf rootfs on x86_64
     cp "$(which qemu-arm-static)" "${ROOTFS}/usr/bin/"
@@ -187,22 +234,32 @@ bootstrap_rootfs() {
 configure_rootfs() {
     log "Configuring rootfs..."
 
-    # APT sources — Debian Trixie + Raspberry Pi repo
-    cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
-deb ${DEBIAN_MIRROR} ${DEBIAN_SUITE} main contrib non-free non-free-firmware
-deb ${DEBIAN_MIRROR} ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware
-deb http://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free-firmware
+    # APT sources
+    if [ "${BOOTSTRAP_SUITE}" = "trixie" ]; then
+        cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${BOOTSTRAP_MIRROR} trixie main contrib non-free non-free-firmware
+deb ${BOOTSTRAP_MIRROR} trixie-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security trixie-security main contrib non-free-firmware
 EOF
+    else
+        cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
+deb ${BOOTSTRAP_MIRROR} ${BOOTSTRAP_SUITE} main restricted universe multiverse
+deb ${BOOTSTRAP_MIRROR} ${BOOTSTRAP_SUITE}-updates main restricted universe multiverse
+deb ${BOOTSTRAP_MIRROR} ${BOOTSTRAP_SUITE}-security main restricted universe multiverse
+EOF
+    fi
 
-    # Add Raspberry Pi APT repo
-    mkdir -p "${ROOTFS}/etc/apt/sources.list.d" "${ROOTFS}/usr/share/keyrings"
-    curl -fsSL https://archive.raspberrypi.com/debian/pool/main/r/raspberrypi-archive-keyring/raspberrypi-archive-keyring_2021.1.1+rpt1_all.deb \
-        -o "${WORK_DIR}/rpi-keyring.deb" || true
-    if [ -f "${WORK_DIR}/rpi-keyring.deb" ]; then
-        dpkg-deb -x "${WORK_DIR}/rpi-keyring.deb" "${ROOTFS}/"
-        cat > "${ROOTFS}/etc/apt/sources.list.d/raspi.list" <<EOF
-deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] ${RPI_MIRROR} bookworm main
+    # Add Raspberry Pi APT repo (if accessible)
+    if [ "${USE_RPI_REPO}" = "1" ]; then
+        mkdir -p "${ROOTFS}/etc/apt/sources.list.d" "${ROOTFS}/usr/share/keyrings"
+        curl -fsSL https://archive.raspberrypi.com/debian/pool/main/r/raspberrypi-archive-keyring/raspberrypi-archive-keyring_2021.1.1+rpt1_all.deb \
+            -o "${WORK_DIR}/rpi-keyring.deb" || true
+        if [ -f "${WORK_DIR}/rpi-keyring.deb" ]; then
+            dpkg-deb -x "${WORK_DIR}/rpi-keyring.deb" "${ROOTFS}/"
+            cat > "${ROOTFS}/etc/apt/sources.list.d/raspi.list" <<EOF
+deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] http://archive.raspberrypi.com/debian bookworm main
 EOF
+        fi
     fi
 
     # Hostname
@@ -213,11 +270,9 @@ EOF
 EOF
 
     # fstab — use PARTUUID from the loop device
-    local p1="${PART1:-${LOOP}p1}"
-    local p2="${PART2:-${LOOP}p2}"
     local boot_uuid root_uuid
-    boot_uuid=$(blkid -s PARTUUID -o value "${p1}" 2>/dev/null || echo "fixme-boot")
-    root_uuid=$(blkid -s PARTUUID -o value "${p2}" 2>/dev/null || echo "fixme-root")
+    boot_uuid=$(blkid -s PARTUUID -o value "${PART1}" 2>/dev/null || echo "fixme-boot")
+    root_uuid=$(blkid -s PARTUUID -o value "${PART2}" 2>/dev/null || echo "fixme-root")
     cat > "${ROOTFS}/etc/fstab" <<EOF
 PARTUUID=${root_uuid}  /               ext4  defaults,noatime  0 1
 PARTUUID=${boot_uuid}  /boot/firmware  vfat  defaults          0 2
@@ -232,12 +287,18 @@ snd_soc_es8388
 dwc2
 MODULES
 
-    # DevTerm config files from stage-devterm/
-    cp "${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/config.txt" \
-       "${ROOTFS}/boot/firmware/config.txt"
+    # DevTerm boot config files
+    local config_txt="${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/config.txt"
+    local cmdline="console=serial0,115200 console=tty1 root=PARTUUID=${root_uuid} rootfstype=ext4 fsck.repair=yes rootwait quiet"
 
-    echo "console=serial0,115200 console=tty1 root=PARTUUID=${root_uuid} rootfstype=ext4 fsck.repair=yes rootwait quiet" \
-       > "${ROOTFS}/boot/firmware/cmdline.txt"
+    if [ "${BOOT_MOUNTED}" = "1" ]; then
+        cp "${config_txt}" "${ROOTFS}/boot/firmware/config.txt"
+        echo "${cmdline}" > "${ROOTFS}/boot/firmware/cmdline.txt"
+    else
+        MTOOLSRC="${MTOOLSRC_FILE}" mcopy -o "${config_txt}" b:/config.txt
+        echo "${cmdline}" > "${WORK_DIR}/cmdline.txt"
+        MTOOLSRC="${MTOOLSRC_FILE}" mcopy -o "${WORK_DIR}/cmdline.txt" b:/cmdline.txt
+    fi
 
     cp "${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/asound.conf" \
        "${ROOTFS}/etc/asound.conf"
@@ -378,6 +439,7 @@ fi
 
 mkdir -p "${WORK_DIR}"
 install_deps
+detect_mirrors
 setup_binfmt
 create_image
 download_firmware

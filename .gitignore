@@ -8,3 +8,4 @@ cm3-build/
 deploy/*.img
 deploy/*.img.xz
 deploy/*.tar.xz
+work/
