@@ -8,8 +8,8 @@ TARGET_HOSTNAME=devterm
 KEYBOARD_KEYMAP=us
 KEYBOARD_LAYOUT="English (US)"
 TIMEZONE_DEFAULT=UTC
-FIRST_USER_NAME=clockwork
-FIRST_USER_PASS=clockwork
+FIRST_USER_NAME=lett
+FIRST_USER_PASS=hell
 ENABLE_SSH=1
 
 # Build only up to stage2 (lite) plus our custom DevTerm stage

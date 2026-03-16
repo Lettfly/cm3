@@ -1,28 +1,32 @@
 #!/bin/bash
 # build-native.sh — Build DevTerm CM3 arm32 image natively
-# Uses Ubuntu Noble armhf (ports.ubuntu.com) + RPi firmware from GitHub
-# Suitable for environments where deb.debian.org / raspbian is blocked.
+# Target: WSL2 Ubuntu 22.04 x64 (or any Debian/Ubuntu x86_64 host)
+# Uses Debian Trixie armhf + RPi firmware from GitHub
 set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-WORK_DIR="${WORK_DIR:-/home/user/cm3-build}"
-DEPLOY_DIR="${DEPLOY_DIR:-/home/user/cm3/deploy}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${WORK_DIR:-${SCRIPT_DIR}/work}"
+DEPLOY_DIR="${DEPLOY_DIR:-${SCRIPT_DIR}/deploy}"
 IMG_NAME="DevTerm-CM3-Trixie-$(date +%Y%m%d)"
 
 ROOTFS="${WORK_DIR}/rootfs"
-BOOT_MNT="${WORK_DIR}/boot"
 IMG_FILE="${WORK_DIR}/${IMG_NAME}.img"
 
 # Partition sizes
 BOOT_MB=256
 ROOT_MB=3072   # 3 GB rootfs
 
-UBUNTU_MIRROR="http://ports.ubuntu.com/ubuntu-ports"
-UBUNTU_SUITE="noble"   # Ubuntu 24.04 LTS — armhf, Debian trixie equivalent
+# Debian Trixie as target (full network access on WSL2)
+DEBIAN_MIRROR="http://deb.debian.org/debian"
+DEBIAN_SUITE="trixie"
 
-FIRST_USER=clockwork
-FIRST_PASS=clockwork
-HOSTNAME=devterm
+# Raspberry Pi package repo
+RPI_MIRROR="http://archive.raspberrypi.com/debian"
+
+FIRST_USER=lett
+FIRST_PASS=hell
+TARGET_HOSTNAME=devterm
 
 # GitHub tag for RPi firmware (latest stable CM3/RPi3 compatible)
 FIRMWARE_TAG="1.20240529"
@@ -30,23 +34,43 @@ FIRMWARE_BASE="https://github.com/raspberrypi/firmware/raw/${FIRMWARE_TAG}/boot"
 
 log() { echo "[$(date +%T)] $*"; }
 
-# ── Prerequisites ──────────────────────────────────────────────────────────────
-check_deps() {
-    for cmd in debootstrap parted mkfs.vfat mkfs.ext4 qemu-arm-static curl xz; do
-        command -v "$cmd" &>/dev/null || { echo "ERROR: missing $cmd"; exit 1; }
+# ── Install host build dependencies (Ubuntu 22.04) ───────────────────────────
+install_deps() {
+    log "Checking / installing build dependencies..."
+    local pkgs=(
+        debootstrap parted dosfstools e2fsprogs xz-utils
+        qemu-user-static binfmt-support
+        curl kpartx mtools rsync
+    )
+    local missing=()
+    for p in "${pkgs[@]}"; do
+        dpkg -s "$p" &>/dev/null || missing+=("$p")
     done
+    if [ ${#missing[@]} -gt 0 ]; then
+        log "Installing: ${missing[*]}"
+        apt-get update -qq
+        apt-get install -y "${missing[@]}"
+    fi
 }
 
 # ── Ensure binfmt_misc + qemu-arm registered ──────────────────────────────────
 setup_binfmt() {
-    if [ ! -f /proc/sys/fs/binfmt_misc/qemu-arm-rpi ]; then
+    if [ ! -d /proc/sys/fs/binfmt_misc ]; then
         mount binfmt_misc -t binfmt_misc /proc/sys/fs/binfmt_misc 2>/dev/null || true
-        echo ':qemu-arm-rpi:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-arm-static:F' \
-            > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
-        log "binfmt_misc: qemu-arm-rpi registered"
-    else
-        log "binfmt_misc: qemu-arm-rpi already registered"
     fi
+    # On WSL2 with qemu-user-static + binfmt-support, it's usually auto-registered
+    if [ ! -f /proc/sys/fs/binfmt_misc/qemu-arm ]; then
+        update-binfmts --enable qemu-arm 2>/dev/null || true
+        # Fallback: manual registration
+        if [ ! -f /proc/sys/fs/binfmt_misc/qemu-arm ] && \
+           [ ! -f /proc/sys/fs/binfmt_misc/qemu-arm-rpi ]; then
+            local qemu_bin
+            qemu_bin=$(which qemu-arm-static 2>/dev/null || echo /usr/bin/qemu-arm-static)
+            echo ":qemu-arm-rpi:M::\x7fELF\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x28\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:${qemu_bin}:F" \
+                > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+        fi
+    fi
+    log "binfmt_misc: $(ls /proc/sys/fs/binfmt_misc/qemu-arm* 2>/dev/null || echo 'registered via system')"
 }
 
 # ── Create empty image with two partitions ─────────────────────────────────────
@@ -61,17 +85,42 @@ create_image() {
         mkpart primary ext4   $(( 4 + BOOT_MB ))MiB 100% \
         set 1 boot on
 
-    # Attach via loop device
+    # Attach via loop device with partition scanning
     LOOP=$(losetup --find --show --partscan "${IMG_FILE}")
     log "Loop device: ${LOOP}"
 
-    mkfs.vfat -F 32 -n boot   "${LOOP}p1"
-    mkfs.ext4 -L rootfs        "${LOOP}p2"
+    # Wait for partition devices to appear (WSL2 may be slower)
+    local retries=10
+    while [ ! -b "${LOOP}p1" ] && [ $retries -gt 0 ]; do
+        sleep 0.5
+        partprobe "${LOOP}" 2>/dev/null || true
+        retries=$((retries - 1))
+    done
 
-    mkdir -p "${BOOT_MNT}" "${ROOTFS}"
-    mount "${LOOP}p2" "${ROOTFS}"
+    if [ -b "${LOOP}p1" ]; then
+        log "Partitions detected: ${LOOP}p1, ${LOOP}p2"
+    else
+        # Fallback: use kpartx for device-mapper based partition access
+        log "Partition devices not found, trying kpartx..."
+        kpartx -av "${LOOP}"
+        local dm_name
+        dm_name=$(basename "${LOOP}")
+        PART1="/dev/mapper/${dm_name}p1"
+        PART2="/dev/mapper/${dm_name}p2"
+        USE_KPARTX=1
+    fi
+
+    local p1="${PART1:-${LOOP}p1}"
+    local p2="${PART2:-${LOOP}p2}"
+
+    mkfs.vfat -F 32 -n boot   "${p1}"
+    mkfs.ext4 -L rootfs -q    "${p2}"
+
+    mkdir -p "${ROOTFS}"
+    mount "${p2}" "${ROOTFS}"
     mkdir -p "${ROOTFS}/boot/firmware"
-    mount "${LOOP}p1" "${ROOTFS}/boot/firmware"
+    mount "${p1}" "${ROOTFS}/boot/firmware"
+    log "Partitions formatted and mounted"
 }
 
 # ── Download RPi firmware files from GitHub ────────────────────────────────────
@@ -83,96 +132,122 @@ download_firmware() {
         start.elf
         start_cd.elf
         start4.elf
+        start4cd.elf
         fixup.dat
         fixup_cd.dat
         fixup4.dat
+        fixup4cd.dat
         LICENCE.broadcom
         COPYING.linux
-        kernel7.img          # ARMv7 32-bit kernel (RPi 3 / CM3)
-        bcm2837-rpi-cm3-io3.dtb
-        bcm2837-rpi-3-b.dtb
-        overlays/miniuart-bt.dtbo
-        overlays/i2s-mmap.dtbo
-        overlays/dwc2.dtbo
-        overlays/gpio-fan.dtbo
+        kernel7.img
+        bcm2710-rpi-cm3.dtb
+        bcm2710-rpi-3-b.dtb
+    )
+    local overlays=(
+        miniuart-bt.dtbo
+        dwc2.dtbo
+        gpio-fan.dtbo
+        i2s-dac.dtbo
     )
     mkdir -p "${dst}/overlays"
     for f in "${files[@]}"; do
-        log "  fetching ${f} ..."
-        curl -fsSL "${FIRMWARE_BASE}/${f}" -o "${dst}/${f}" || {
-            log "  WARNING: could not download ${f}, skipping"
-        }
+        printf "  %-40s" "${f}"
+        curl -fsSL --retry 3 "${FIRMWARE_BASE}/${f}" -o "${dst}/${f}" 2>/dev/null \
+            && echo "OK" || echo "SKIP"
     done
+    for f in "${overlays[@]}"; do
+        printf "  overlays/%-32s" "${f}"
+        curl -fsSL --retry 3 "${FIRMWARE_BASE}/overlays/${f}" -o "${dst}/overlays/${f}" 2>/dev/null \
+            && echo "OK" || echo "SKIP"
+    done
+    log "Firmware download complete"
 }
 
-# ── Bootstrap Ubuntu Noble armhf rootfs ───────────────────────────────────────
+# ── Bootstrap Debian Trixie armhf rootfs ──────────────────────────────────────
 bootstrap_rootfs() {
-    log "Bootstrapping Ubuntu Noble armhf rootfs..."
+    log "Bootstrapping Debian Trixie armhf rootfs (this takes a few minutes)..."
     debootstrap \
         --arch=armhf \
-        --components=main,universe,multiverse \
+        --components=main,contrib,non-free,non-free-firmware \
+        --include=ca-certificates \
         --foreign \
-        "${UBUNTU_SUITE}" \
+        "${DEBIAN_SUITE}" \
         "${ROOTFS}" \
-        "${UBUNTU_MIRROR}"
+        "${DEBIAN_MIRROR}"
 
     # Copy qemu-arm-static so we can chroot into armhf rootfs on x86_64
-    cp /usr/bin/qemu-arm-static "${ROOTFS}/usr/bin/"
+    cp "$(which qemu-arm-static)" "${ROOTFS}/usr/bin/"
 
     log "Running debootstrap second stage inside armhf chroot..."
     chroot "${ROOTFS}" /debootstrap/debootstrap --second-stage
+    log "Bootstrap complete"
 }
 
 # ── Configure rootfs ──────────────────────────────────────────────────────────
 configure_rootfs() {
     log "Configuring rootfs..."
 
-    # APT sources
+    # APT sources — Debian Trixie + Raspberry Pi repo
     cat > "${ROOTFS}/etc/apt/sources.list" <<EOF
-deb ${UBUNTU_MIRROR} ${UBUNTU_SUITE} main restricted universe multiverse
-deb ${UBUNTU_MIRROR} ${UBUNTU_SUITE}-updates main restricted universe multiverse
-deb ${UBUNTU_MIRROR} ${UBUNTU_SUITE}-security main restricted universe multiverse
+deb ${DEBIAN_MIRROR} ${DEBIAN_SUITE} main contrib non-free non-free-firmware
+deb ${DEBIAN_MIRROR} ${DEBIAN_SUITE}-updates main contrib non-free non-free-firmware
+deb http://security.debian.org/debian-security ${DEBIAN_SUITE}-security main contrib non-free-firmware
 EOF
+
+    # Add Raspberry Pi APT repo
+    mkdir -p "${ROOTFS}/etc/apt/sources.list.d" "${ROOTFS}/usr/share/keyrings"
+    curl -fsSL https://archive.raspberrypi.com/debian/pool/main/r/raspberrypi-archive-keyring/raspberrypi-archive-keyring_2021.1.1+rpt1_all.deb \
+        -o "${WORK_DIR}/rpi-keyring.deb" || true
+    if [ -f "${WORK_DIR}/rpi-keyring.deb" ]; then
+        dpkg-deb -x "${WORK_DIR}/rpi-keyring.deb" "${ROOTFS}/"
+        cat > "${ROOTFS}/etc/apt/sources.list.d/raspi.list" <<EOF
+deb [signed-by=/usr/share/keyrings/raspberrypi-archive-keyring.gpg] ${RPI_MIRROR} bookworm main
+EOF
+    fi
 
     # Hostname
-    echo "${HOSTNAME}" > "${ROOTFS}/etc/hostname"
+    echo "${TARGET_HOSTNAME}" > "${ROOTFS}/etc/hostname"
     cat > "${ROOTFS}/etc/hosts" <<EOF
 127.0.0.1 localhost
-127.0.1.1 ${HOSTNAME}
+127.0.1.1 ${TARGET_HOSTNAME}
 EOF
 
-    # fstab
-    BOOT_PARTUUID=$(blkid -s PARTUUID -o value "${LOOP}p1")
-    ROOT_PARTUUID=$(blkid -s PARTUUID -o value "${LOOP}p2")
+    # fstab — use PARTUUID from the loop device
+    local p1="${PART1:-${LOOP}p1}"
+    local p2="${PART2:-${LOOP}p2}"
+    local boot_uuid root_uuid
+    boot_uuid=$(blkid -s PARTUUID -o value "${p1}" 2>/dev/null || echo "fixme-boot")
+    root_uuid=$(blkid -s PARTUUID -o value "${p2}" 2>/dev/null || echo "fixme-root")
     cat > "${ROOTFS}/etc/fstab" <<EOF
-PARTUUID=${ROOT_PARTUUID} /              ext4 defaults,noatime  0 1
-PARTUUID=${BOOT_PARTUUID} /boot/firmware vfat defaults          0 2
+PARTUUID=${root_uuid}  /               ext4  defaults,noatime  0 1
+PARTUUID=${boot_uuid}  /boot/firmware  vfat  defaults          0 2
 EOF
 
-    # Modules
-    cat >> "${ROOTFS}/etc/modules" <<EOF
+    # Kernel modules
+    cat >> "${ROOTFS}/etc/modules" <<'MODULES'
 i2c-dev
 i2c-bcm2835
 spi-bcm2835
+snd_soc_es8388
 dwc2
-EOF
+MODULES
 
-    # Copy boot config files from our stage-devterm
-    cp /home/user/cm3/stage-devterm/01-devterm-config/files/config.txt \
+    # DevTerm config files from stage-devterm/
+    cp "${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/config.txt" \
        "${ROOTFS}/boot/firmware/config.txt"
-    # Generate cmdline.txt with real PARTUUID
-    echo "console=serial0,115200 console=tty1 root=PARTUUID=${ROOT_PARTUUID} rootfstype=ext4 fsck.repair=yes rootwait quiet" \
+
+    echo "console=serial0,115200 console=tty1 root=PARTUUID=${root_uuid} rootfstype=ext4 fsck.repair=yes rootwait quiet" \
        > "${ROOTFS}/boot/firmware/cmdline.txt"
 
-    # ALSA config
-    cp /home/user/cm3/stage-devterm/01-devterm-config/files/asound.conf \
+    cp "${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/asound.conf" \
        "${ROOTFS}/etc/asound.conf"
 
-    # devterm-init script
-    install -m 755 /home/user/cm3/stage-devterm/01-devterm-config/files/devterm-init \
+    install -m 755 "${SCRIPT_DIR}/stage-devterm/01-devterm-config/files/devterm-init" \
         "${ROOTFS}/usr/local/bin/devterm-init"
-    install -m 644 /home/user/cm3/stage-devterm/02-devterm-services/files/devterm-init.service \
+    install -m 644 "${SCRIPT_DIR}/stage-devterm/02-devterm-services/files/devterm-init.service" \
         "${ROOTFS}/etc/systemd/system/devterm-init.service"
+
+    log "Configuration complete"
 }
 
 # ── Install packages inside chroot ────────────────────────────────────────────
@@ -180,9 +255,9 @@ install_packages() {
     log "Installing packages inside armhf chroot..."
 
     # Bind mounts needed for apt/systemctl
-    mount --bind /proc "${ROOTFS}/proc"
-    mount --bind /sys  "${ROOTFS}/sys"
-    mount --bind /dev  "${ROOTFS}/dev"
+    mount --bind /proc    "${ROOTFS}/proc"
+    mount --bind /sys     "${ROOTFS}/sys"
+    mount --bind /dev     "${ROOTFS}/dev"
     mount --bind /dev/pts "${ROOTFS}/dev/pts"
 
     # Prevent services from starting during install
@@ -191,6 +266,9 @@ install_packages() {
 exit 101
 POLICY
     chmod +x "${ROOTFS}/usr/sbin/policy-rc.d"
+
+    # DNS for chroot
+    cp /etc/resolv.conf "${ROOTFS}/etc/resolv.conf"
 
     chroot "${ROOTFS}" /bin/bash -e <<CHROOT
 export DEBIAN_FRONTEND=noninteractive
@@ -205,9 +283,9 @@ apt-get install -y --no-install-recommends \
     fonts-terminus \
     htop \
     i2c-tools \
+    locales \
     network-manager \
     openssh-server \
-    python3-rpi.gpio \
     python3-serial \
     python3-smbus \
     screen \
@@ -220,19 +298,32 @@ apt-get install -y --no-install-recommends \
 # Create user
 useradd -m -s /bin/bash ${FIRST_USER} || true
 echo "${FIRST_USER}:${FIRST_PASS}" | chpasswd
-usermod -aG sudo,audio,video,bluetooth,dialout,i2c,spi ${FIRST_USER}
+usermod -aG sudo,audio,video,bluetooth,dialout ${FIRST_USER}
 
 # Enable services
-systemctl enable ssh.service devterm-init.service bluetooth.service NetworkManager.service 2>/dev/null || true
+systemctl enable ssh.service bluetooth.service NetworkManager.service 2>/dev/null || true
+ln -sf /etc/systemd/system/devterm-init.service \
+    /etc/systemd/system/multi-user.target.wants/devterm-init.service 2>/dev/null || true
 
 # Locale
+sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen 2>/dev/null || true
+echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
 locale-gen en_US.UTF-8 || true
+echo 'LANG=en_US.UTF-8' > /etc/default/locale
+
+# Timezone
+ln -sf /usr/share/zoneinfo/UTC /etc/localtime
+
+# Console font for 1280x480 screen
+sed -i 's/^FONTFACE=.*/FONTFACE="Terminus"/'   /etc/default/console-setup 2>/dev/null || true
+sed -i 's/^FONTSIZE=.*/FONTSIZE="6x12"/'        /etc/default/console-setup 2>/dev/null || true
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 CHROOT
 
     rm -f "${ROOTFS}/usr/sbin/policy-rc.d"
+    log "Package installation complete"
 }
 
 # ── Unmount and package image ─────────────────────────────────────────────────
@@ -248,11 +339,15 @@ finalize() {
     rm -f "${ROOTFS}/usr/bin/qemu-arm-static"
 
     sync
-    umount "${ROOTFS}/boot/firmware"
-    umount "${ROOTFS}"
-    losetup -d "${LOOP}"
+    umount "${ROOTFS}/boot/firmware" 2>/dev/null || true
+    umount "${ROOTFS}" 2>/dev/null || true
 
-    log "Compressing image → ${IMG_NAME}.img.xz ..."
+    if [ "${USE_KPARTX:-0}" = "1" ]; then
+        kpartx -dv "${LOOP}" 2>/dev/null || true
+    fi
+    losetup -d "${LOOP}" 2>/dev/null || true
+
+    log "Compressing image -> ${IMG_NAME}.img.xz ..."
     mkdir -p "${DEPLOY_DIR}"
     xz -T0 -c "${IMG_FILE}" > "${DEPLOY_DIR}/${IMG_NAME}.img.xz"
     sha256sum "${DEPLOY_DIR}/${IMG_NAME}.img.xz" > "${DEPLOY_DIR}/${IMG_NAME}.img.xz.sha256"
@@ -268,13 +363,21 @@ cleanup() {
               "${ROOTFS}/boot/firmware" "${ROOTFS}"; do
         umount "$m" 2>/dev/null || true
     done
+    if [ "${USE_KPARTX:-0}" = "1" ]; then
+        kpartx -dv "${LOOP}" 2>/dev/null || true
+    fi
     [ -n "${LOOP:-}" ] && losetup -d "${LOOP}" 2>/dev/null || true
 }
 trap cleanup EXIT
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: This script must be run as root (use sudo)." >&2
+    exit 1
+fi
+
 mkdir -p "${WORK_DIR}"
-check_deps
+install_deps
 setup_binfmt
 create_image
 download_firmware

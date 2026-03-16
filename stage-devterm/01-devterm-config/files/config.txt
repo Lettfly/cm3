@@ -14,7 +14,7 @@ hdmi_force_hotplug=1
 
 # Audio: ES8388 via I2S
 dtparam=audio=off
-dtoverlay=i2s-mmap
+dtoverlay=i2s-dac
 
 # I2C
 dtparam=i2c_arm=on
