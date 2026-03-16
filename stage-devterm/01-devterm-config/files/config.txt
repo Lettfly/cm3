@@ -1,0 +1,37 @@
+# DevTerm CM3 boot configuration (Trixie arm32)
+
+# Force 32-bit mode for armhf
+arm_64bit=0
+
+# GPU memory
+gpu_mem=64
+
+# Display: 1280x480 IPS panel
+framebuffer_width=1280
+framebuffer_height=480
+display_hdmi_boost=4
+hdmi_force_hotplug=1
+
+# Audio: ES8388 via I2S
+dtparam=audio=off
+dtoverlay=i2s-mmap
+
+# I2C
+dtparam=i2c_arm=on
+dtparam=i2c_vc=on
+
+# SPI
+dtparam=spi=on
+
+# UART for thermal printer (GPIO14/15)
+enable_uart=1
+dtoverlay=miniuart-bt
+
+# USB OTG / DWC2
+dtoverlay=dwc2,dr_mode=host
+
+# DevTerm CM3 overlay
+dtoverlay=devterm-cm3
+
+# Fan control
+dtoverlay=gpio-fan,gpiopin=4,temp=60000

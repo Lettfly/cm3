@@ -1,0 +1,15 @@
+# /etc/modules - DevTerm CM3
+
+# I2C
+i2c-dev
+i2c-bcm2835
+
+# SPI
+spi-bcm2835
+
+# Audio codec
+snd_soc_es8388
+snd_soc_simple_card
+
+# USB gadget
+dwc2

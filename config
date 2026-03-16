@@ -1,0 +1,16 @@
+# pi-gen configuration for DevTerm CM3 Trixie arm32 image
+
+IMG_NAME="DevTerm-CM3-Trixie"
+RELEASE=trixie
+DEPLOY_COMPRESSION=xz
+LOCALE_DEFAULT=en_US.UTF-8
+TARGET_HOSTNAME=devterm
+KEYBOARD_KEYMAP=us
+KEYBOARD_LAYOUT="English (US)"
+TIMEZONE_DEFAULT=UTC
+FIRST_USER_NAME=clockwork
+FIRST_USER_PASS=clockwork
+ENABLE_SSH=1
+
+# Build only up to stage2 (lite) plus our custom DevTerm stage
+STAGE_LIST="stage0 stage1 stage2 stage-devterm"

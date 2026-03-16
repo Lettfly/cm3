@@ -1,0 +1,15 @@
+#!/bin/bash
+# DevTerm CM3 initialization script
+# Runs at boot to set up hardware-specific settings
+
+# Set display resolution via fbset
+fbset -g 1280 480 1280 960 16 2>/dev/null || true
+
+# Set backlight brightness (0-255)
+BACKLIGHT=/sys/class/backlight/backlight/brightness
+[ -f "$BACKLIGHT" ] && echo 200 > "$BACKLIGHT"
+
+# Rotate touchpad input if needed
+xinput set-prop "ClockworkPi DevTerm Keyboard Trackball" \
+    "Coordinate Transformation Matrix" \
+    1 0 0 0 1 0 0 0 1 2>/dev/null || true
