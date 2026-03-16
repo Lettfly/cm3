@@ -4,7 +4,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PI_GEN_DIR="${SCRIPT_DIR}/pi-gen"
 PI_GEN_REPO="https://github.com/RPi-Distro/pi-gen.git"
-PI_GEN_BRANCH="arm"
+PI_GEN_BRANCH="master"
 
 # ── Check prerequisites ────────────────────────────────────────────────────────
 check_deps() {
