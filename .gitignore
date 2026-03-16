@@ -1,0 +1,10 @@
+# Cloned upstream pi-gen (downloaded by build.sh)
+pi-gen/
+
+# Build working directory
+cm3-build/
+
+# Compiled image artifacts (too large for git)
+deploy/*.img
+deploy/*.img.xz
+deploy/*.tar.xz
